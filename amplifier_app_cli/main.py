@@ -1076,9 +1076,18 @@ def get_module_search_paths() -> list[Path]:
     default=None,
     help="Install shell completion for the specified shell (bash, zsh, or fish)",
 )
+@click.option(
+    "--sandbox",
+    is_flag=True,
+    help="Run remotely on Ampbox",
+)
 @click.pass_context
-def cli(ctx, install_completion):
+def cli(ctx, install_completion, sandbox):
     """Amplifier - AI-powered modular development platform."""
+    # Store sandbox mode in context for subcommands
+    ctx.ensure_object(dict)
+    ctx.obj['sandbox_mode'] = sandbox
+    
     # Handle --install-completion flag
     if install_completion:
         # Auto-detect shell (always, no argument needed)

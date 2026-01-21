@@ -62,7 +62,9 @@ def register_run_command(
         default="text",
         help="Output format: text (markdown), json (response only), json-trace (full execution detail)",
     )
+    @click.pass_context
     def run(
+        ctx: click.Context,
         prompt: str | None,
         bundle: str | None,
         provider: str,
@@ -74,6 +76,25 @@ def register_run_command(
         output_format: str,
     ):
         """Execute a prompt or start an interactive session."""
+        # Check if sandbox mode is enabled
+        sandbox_mode = ctx.obj.get("sandbox_mode", False) if ctx.obj else False
+
+        if sandbox_mode:
+            # Route to remote runner for sandbox execution
+            from ..remote_runner import RemoteRunner
+
+            runner = RemoteRunner()
+
+            if resume:
+                runner.resume(resume)
+            elif prompt:
+                runner.run(prompt, bundle)
+            else:
+                console.print("[red]Error:[/red] Prompt required in sandbox mode")
+                sys.exit(1)
+            return
+
+        # Local execution path (existing behavior)
         from ..session_store import SessionStore
 
         # Handle --resume flag
