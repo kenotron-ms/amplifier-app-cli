@@ -23,12 +23,13 @@ from amplifier_core import AmplifierSession
 from amplifier_core import ModuleValidationError  # pyright: ignore[reportAttributeAccessIssue]
 from amplifier_foundation import sanitize_message
 from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.application.run_in_terminal import run_in_terminal
 from prompt_toolkit.patch_stdout import patch_stdout
-from rich.panel import Panel
+from prompt_toolkit.styles import Style
 
 from .commands.agents import agents as agents_group
 from .commands.allowed_dirs import allowed_dirs as allowed_dirs_group
@@ -51,7 +52,6 @@ from .commands.update import update as update_cmd
 from .commands.version import version as version_cmd
 from .console import Markdown
 from .console import console
-from .effective_config import get_effective_config_summary
 from .key_manager import KeyManager
 from .session_store import SessionStore
 from .ui.error_display import display_validation_error
@@ -1262,7 +1262,106 @@ async def _process_runtime_mentions(session: AmplifierSession, prompt: str) -> N
         await context.add_message(msg_dict)
 
 
-def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSession:
+class _AttachmentContext:
+    """Callable interceptor for ``context.add_message`` that injects a
+    clipboard attachment block into the first outgoing user message.
+
+    ``session.execute()`` accepts only a ``str`` prompt — the kernel boundary
+    is intentionally narrow (mechanism, not policy). The orchestrator itself
+    calls ``context.add_message({"role": "user", "content": prompt})`` to
+    store the user turn. By temporarily replacing ``context.add_message`` with
+    this interceptor we enrich that one call without touching the kernel
+    contract.
+
+    Usage::
+
+        orig = ctx.add_message
+        ctx.add_message = _AttachmentContext(orig, _make_attachment_block(...))
+        try:
+            await session.execute(prompt_text)
+        finally:
+            del ctx.add_message  # removes instance attr, restores class method
+    """
+
+    def __init__(self, orig_add, attachment_block: dict) -> None:
+        self._orig_add = orig_add
+        self._attachment = attachment_block
+        self._injected = False
+
+    async def __call__(self, msg: dict) -> None:
+        if not self._injected and msg.get("role") == "user":
+            self._injected = True
+            text = msg.get("content", "")
+            if not isinstance(text, str):
+                text = str(text)
+            await self._orig_add(
+                {
+                    **msg,
+                    "content": [
+                        self._attachment,
+                        {"type": "text", "text": text},
+                    ],
+                }
+            )
+        else:
+            await self._orig_add(msg)
+
+
+def _describe_attachment(media_type: str) -> str:
+    """Return a short human-readable label for a clipboard attachment type."""
+    if media_type.startswith("image/"):
+        return "Image"
+    if media_type == "application/pdf":
+        return "PDF"
+    if media_type == "text/plain":
+        return "Text"
+    return "File"
+
+
+def _make_attachment_block(base64_data: str, media_type: str) -> dict:
+    """Build the correct Anthropic content block for the given MIME type.
+
+    Mapping (per Anthropic Messages API):
+    - ``image/*``         → ``image`` block  with ``base64`` source
+    - ``application/pdf`` → ``document`` block with ``base64`` source (Claude 3.5+)
+    - ``text/plain``      → ``document`` block with ``text`` source (raw string, not base64)
+    """
+    if media_type.startswith("image/"):
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64_data,
+            },
+        }
+    if media_type == "text/plain":
+        import base64 as _b64
+
+        text = _b64.standard_b64decode(base64_data).decode("utf-8", errors="replace")
+        return {
+            "type": "document",
+            "source": {
+                "type": "text",
+                "data": text,
+            },
+        }
+    # application/pdf and any future document MIME types
+    return {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64_data,
+        },
+    }
+
+
+def _create_prompt_session(
+    get_active_mode: Callable | None = None,
+    get_coordinator: Callable | None = None,
+    clipboard_state: dict | None = None,
+) -> PromptSession:
     """Create configured PromptSession for REPL.
 
     Provides:
@@ -1272,9 +1371,18 @@ def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSes
     - History search with Ctrl-R
     - Multi-line input with Ctrl-J
     - Graceful fallback to in-memory history on errors
+    - Clipboard image attachment with Ctrl-V
 
     Args:
         get_active_mode: Optional callable that returns the current active mode name
+        get_coordinator: Optional callable that returns the current coordinator instance,
+                         used by the Ctrl+O binding to access ``last_tool_output``.
+        clipboard_state: Optional mutable dict shared with the REPL loop.  When
+                         Ctrl+V is pressed, the captured content is stored here under
+                         the key ``"attachment"`` as a ``(base64_data, media_type)``
+                         tuple.  *media_type* is one of ``image/png``, ``image/jpeg``,
+                         ``image/gif``, ``image/webp``, ``application/pdf``, or
+                         ``text/plain``.
 
     Returns:
         Configured PromptSession instance
@@ -1318,15 +1426,132 @@ def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSes
         """Submit input on Enter."""
         event.current_buffer.validate_and_handle()
 
-    # Dynamic prompt that shows [mode] indicator when a mode is active
+    @kb.add("c-o")
+    def expand_last_tool_output(event) -> None:
+        """Toggle expand/collapse for the last tool output block."""
+        if get_coordinator is None:
+            return
+        coordinator = get_coordinator()
+        if coordinator is None:
+            return
+        last_output = coordinator.get_capability("last_tool_output")
+        if not last_output:
+            return
+
+        expanding = not last_output.get("expanded", False)
+        last_output["expanded"] = expanding
+        if expanding:
+            full_text = last_output.get("full_text", "")
+
+            def _print_output() -> None:
+                for line in full_text.splitlines():
+                    console.print(f"  [dim]{line}[/dim]")
+
+            run_in_terminal(_print_output)
+
+    @kb.add("c-v", eager=True)
+    def attach_clipboard_image(event) -> None:
+        """Attach clipboard content (image, PDF, or text) to the next message.
+
+        The captured content is stored in ``clipboard_state["attachment"]`` as a
+        ``(base64_data, media_type)`` tuple.  ``_execute_with_interrupt`` reads
+        and clears this entry before calling ``session.execute()``, building a
+        multi-block content list that the orchestrator forwards to the provider.
+
+        Ctrl+V was chosen to match Claude Code's convention and is the natural
+        paste shortcut users already associate with pasting clipboard content.
+        """
+        from prompt_toolkit.shortcuts import print_formatted_text as _pt_print
+
+        def _pt(fragments: list[tuple[str, str]]) -> None:
+            # Route through the app's VT100 output layer rather than Rich's
+            # console.print() to avoid ESC-byte corruption (?[33m) that occurs
+            # when Rich writes to stdout while patch_stdout() is active.
+            _pt_print(FormattedText(fragments), output=event.app.output)
+
+        if clipboard_state is None:
+
+            def _no_state() -> None:
+                _pt(
+                    [
+                        (
+                            "fg:yellow",
+                            "Clipboard image attachment not available in this session.",
+                        )
+                    ]
+                )
+
+            run_in_terminal(_no_state)
+            return
+
+        from .clipboard import get_clipboard_content
+
+        result = get_clipboard_content()
+        if result:
+            clipboard_state["attachment"] = result
+            _base64_data, media_type = result
+            _decoded_bytes = len(_base64_data) * 3 // 4  # approx decoded size
+            if _decoded_bytes < 1024:
+                _size_display = f"~{_decoded_bytes} B"
+            elif _decoded_bytes < 1024 * 1024:
+                _size_display = f"~{_decoded_bytes // 1024} KB"
+            else:
+                _size_display = f"~{_decoded_bytes // (1024 * 1024)} MB"
+            label = _describe_attachment(media_type)
+
+            def _print_attached() -> None:
+                _pt(
+                    [
+                        ("fg:green", f"📎 {label} attached"),
+                        ("", f" ({media_type}, {_size_display})"),
+                        (
+                            "fg:ansidarkgray",
+                            " — will be included with your next message",
+                        ),
+                    ]
+                )
+
+            run_in_terminal(_print_attached)
+        else:
+
+            def _print_none() -> None:
+                _pt(
+                    [
+                        ("fg:yellow", "No file found in clipboard."),
+                        ("", " "),
+                        (
+                            "fg:ansidarkgray",
+                            "Copy an image, PDF, or text then press Ctrl+V.",
+                        ),
+                    ]
+                )
+
+            run_in_terminal(_print_none)
+
+    # Exact hex color #5eead4 for the prompt character via prompt_toolkit's Style system
+    PROMPT_STYLE = Style.from_dict({"prompt.teal": "fg:#5eead4"})
+
+    # Dynamic prompt that shows [mode] indicator when a mode is active.
+    # Uses FormattedText (not HTML) to avoid XML namespace errors from <class:...> tags.
     def get_prompt():
         if get_active_mode:
             active_mode = get_active_mode()
             if active_mode:
-                return HTML(
-                    f"\n<ansicyan>[{active_mode}]</ansicyan><ansigreen><b>></b></ansigreen> "
+                return FormattedText(
+                    [
+                        ("", "\n"),
+                        ("ansicyan", f"[{active_mode}]"),
+                        ("class:prompt.teal", "›"),
+                        ("", " "),
+                    ]
                 )
-        return HTML("\n<ansigreen><b>></b></ansigreen> ")
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("class:prompt.teal", "›"),
+                ("", " "),
+            ]
+        )
 
     return PromptSession(
         message=get_prompt,  # Callable for dynamic prompt
@@ -1335,6 +1560,7 @@ def _create_prompt_session(get_active_mode: Callable | None = None) -> PromptSes
         multiline=True,  # Enable multi-line display
         prompt_continuation="  ",  # Two spaces for alignment (cleaner than "... ")
         enable_history_search=True,  # Enables Ctrl-R
+        style=PROMPT_STYLE,
     )
 
 
@@ -1396,26 +1622,6 @@ async def interactive_chat(
 
     register_incremental_save(session, store, actual_session_id, bundle_name, config)
 
-    # Show banner only for NEW sessions (resume shows banner via history display in commands/session.py)
-    if not session_config.is_resume:
-        config_summary = get_effective_config_summary(config, bundle_name)
-        console.print(
-            Panel.fit(
-                f"[bold cyan]Amplifier Interactive Session[/bold cyan]\n"
-                f"[dim]Session ID: [/dim][dim bright_yellow]{actual_session_id}[/dim bright_yellow]\n"
-                f"[dim]{config_summary.format_banner_line()}[/dim]\n"
-                f"Commands: /help | Multi-line: Ctrl-J | Exit: Ctrl-D",
-                border_style="cyan",
-            )
-        )
-
-    # Create prompt session for history and advanced editing
-    prompt_session = _create_prompt_session(
-        get_active_mode=lambda: command_processor.session.coordinator.session_state.get(
-            "active_mode"
-        )
-    )
-
     # Helper to extract model name from config
     def _extract_model_name() -> str:
         if isinstance(config.get("providers"), list) and config["providers"]:
@@ -1426,6 +1632,28 @@ async def interactive_chat(
                     "default_model", "unknown"
                 )
         return "unknown"
+
+    # Show startup header only for NEW sessions (resume shows banner via history display in commands/session.py)
+    if not session_config.is_resume:
+        from .console import render_startup_header
+
+        render_startup_header(
+            session, actual_session_id, bundle_name, _extract_model_name()
+        )
+
+    # Shared mutable state for clipboard attachment (Ctrl+V).
+    # The key "attachment" holds a (base64_data, media_type) tuple when content
+    # is pending; _execute_with_interrupt pops it before each session.execute() call.
+    _clipboard_state: dict = {}
+
+    # Create prompt session for history and advanced editing
+    prompt_session = _create_prompt_session(
+        get_active_mode=lambda: command_processor.session.coordinator.session_state.get(
+            "active_mode"
+        ),
+        get_coordinator=lambda: session.coordinator,
+        clipboard_state=_clipboard_state,
+    )
 
     # Helper to save session after each turn
     async def _save_session():
@@ -1451,9 +1679,37 @@ async def interactive_chat(
 
     # Helper to execute a prompt with Ctrl+C handling
     async def _execute_with_interrupt(prompt_text: str) -> bool:
-        """Execute prompt with interrupt handling. Returns True if completed, False if cancelled."""
+        """Execute prompt with interrupt handling. Returns True if completed, False if cancelled.
+
+        When clipboard content has been attached via Ctrl+V, the attachment is
+        popped from ``_clipboard_state`` and injected into the first user
+        message the orchestrator writes.
+
+        ``session.execute()`` accepts only a ``str`` prompt — the kernel
+        boundary is intentionally narrow. The orchestrator calls
+        ``context.add_message({"role": "user", "content": prompt})`` itself,
+        so we temporarily replace ``context.add_message`` with an
+        ``_AttachmentContext`` interceptor that enriches that one call.
+
+        Content block type mapping (Anthropic API):
+        - ``image/*``         → ``{"type": "image",    "source": {"type": "base64", ...}}``
+        - ``application/pdf`` → ``{"type": "document",  "source": {"type": "base64", ...}}``
+        - ``text/plain``      → ``{"type": "document",  "source": {"type": "text",   ...}}``
+        """
         # Reset cancellation state for new execution
         session.coordinator.cancellation.reset()
+
+        # If an attachment is pending, temporarily replace context.add_message
+        # with an _AttachmentContext interceptor so the orchestrator's own
+        # add_message call gets the full multimodal content block.
+        pending_attachment = _clipboard_state.pop("attachment", None)
+        _ctx = None
+        if pending_attachment:
+            base64_data, media_type = pending_attachment
+            _ctx = session.coordinator.get("context")
+            _ctx.add_message = _AttachmentContext(
+                _ctx.add_message, _make_attachment_block(base64_data, media_type)
+            )
 
         def sigint_handler(signum, frame):
             """Handle Ctrl+C with graceful/immediate cancellation.
@@ -1540,6 +1796,12 @@ async def interactive_chat(
 
         finally:
             signal.signal(signal.SIGINT, original_handler)
+            # Remove instance-level add_message override to restore class method
+            if _ctx is not None:
+                try:
+                    del _ctx.add_message
+                except AttributeError:
+                    pass
             # Don't reset cancellation here - session.py handles status
 
     # Execute initial prompt if provided
